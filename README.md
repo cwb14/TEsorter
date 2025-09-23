@@ -7,6 +7,9 @@ Since version v1.4, a GENOME mode is supported to identify TE protein domains th
 
 For more details of methods and benchmarking results in classifying TEs, please see [the paper in *Horticulture Research*](https://doi.org/10.1093/hr/uhac017).
 
+# Run this forked version like this:
+PYTHONPATH=./TEsorter python3 -m TEsorter 
+PYTHONPATH=./TEsorter python3 -m TEsorter Guang8B.filtered.fa -db rexdb-plant -p 200 -cov 10 -eval 1e-2 -rule 70-30-80
 
 ## Table of Contents
    * [Installation](#installation)  
