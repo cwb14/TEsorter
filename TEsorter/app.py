@@ -215,7 +215,8 @@ def pipeline(args):
 		args.prefix = '{}.{}'.format(os.path.basename(args.sequence), db_name)
 	Dependency().check_hmmer(db=db_file)
 	if not args.disable_pass2:
-		Dependency().check_blast()
+		Dependency().check_mmseqs()
+
 	if not os.path.exists(args.tmp_dir):
 		os.makedirs(args.tmp_dir)
 
@@ -288,10 +289,16 @@ please switch to the GENOME mode by specifiy `-genome`')
 		get_records(args.sequence, unclassified_seq, list(d_class.keys()), type='fasta', process='remove',format_id=format_gff_id)
 
 		logger.info('using the {} rule'.format(args.pass2_rule))
-		d_class2 = classify_by_blast(classified_seq, unclassified_seq,
-						seqtype=args.seq_type, ncpu=args.processors,
-						min_identtity=args.p2_identity, min_coverge=args.p2_coverage, min_length=args.p2_length,
-						)
+						
+		d_class2 = classify_by_mmseqs(
+                        classified_seq, unclassified_seq,
+                        tmpdir=args.tmp_dir,
+                        prefix="pass2",
+                        ncpu=args.processors,
+                        min_identtity=args.p2_identity,
+                        min_coverge=args.p2_coverage,
+                        )
+
 		fc = open(classify_out, 'a')
 		for unclfed_id, clfed_id in list(d_class2.items()):
 			clfed = d_class[clfed_id]
@@ -431,6 +438,104 @@ def classify_by_blast(db_seq, qry_seq, blast_out=None, seqtype='nucl', ncpu=4,
 	d_class = OrderedDict([(qseqid, rc.sseqid) for qseqid, rc in d_best_hit.items()])
 	return d_class
 
+
+def classify_by_mmseqs(classified_seq, unclassified_seq, tmpdir='./tmp', prefix='pass2',
+                       ncpu=4, min_identtity=80, min_coverge=80):
+    """
+    Use mmseqs easy-cluster to propagate pass1 classifications to unclassified seqs.
+    Returns: OrderedDict {unclassified_id: classified_id_to_copy}
+    """
+    if (not os.path.exists(classified_seq)) or os.path.getsize(classified_seq) == 0:
+        return OrderedDict()
+    if (not os.path.exists(unclassified_seq)) or os.path.getsize(unclassified_seq) == 0:
+        return OrderedDict()
+
+    # mmseqs wants one input fasta => concatenate
+    all_fa = os.path.join(tmpdir, f'{prefix}.all.fa')
+    with open(all_fa, 'w') as out:
+        with open(classified_seq) as f1:
+            shutil.copyfileobj(f1, out)
+        with open(unclassified_seq) as f2:
+            shutil.copyfileobj(f2, out)
+
+    # thresholds from rule (ignore length)
+    min_id = float(min_identtity) / 100.0
+    cov = float(min_coverge) / 100.0
+
+    out_prefix = os.path.join(tmpdir, prefix)
+    out_tmp = os.path.join(tmpdir, prefix + "_mmseqs_tmp")
+
+    # fixed flags as requested
+    cmd = [
+        "mmseqs", "easy-cluster",
+        all_fa, out_prefix, out_tmp,
+        "--min-seq-id", str(min_id),
+        "-c", str(cov),
+        "--cov-mode", "5",
+        "--cluster-reassign", "1",
+        "--seq-id-mode", "1",
+        "--threads", str(ncpu),
+    ]
+    logger.info("Running: %s", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+    cluster_tsv = out_prefix + "_cluster.tsv"
+    if not os.path.exists(cluster_tsv):
+        raise FileNotFoundError(f"mmseqs did not produce {cluster_tsv}")
+
+    classified_ids = set()
+    for rc in SeqIO.parse(open(classified_seq), 'fasta'):
+        classified_ids.add(rc.id)
+
+    unclassified_ids = set()
+    for rc in SeqIO.parse(open(unclassified_seq), 'fasta'):
+        unclassified_ids.add(rc.id)
+
+    # Build cluster rep -> members
+    rep_to_members = OrderedDict()
+    with open(cluster_tsv) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            rep, mem = line.split("\t")[:2]
+            rep_to_members.setdefault(rep, []).append(mem)
+
+    # For each cluster, pick one classified "source" and map unclassified members to it
+    d_class2 = OrderedDict()
+    for rep, members in rep_to_members.items():
+        # find a classified seq within the cluster (rep or any member)
+        source = None
+        if rep in classified_ids:
+            source = rep
+        else:
+            for m in members:
+                if m in classified_ids:
+                    source = m
+                    break
+        if source is None:
+            continue
+
+        # assign all unclassified members in this cluster to 'source'
+        for m in members:
+            if m in unclassified_ids:
+                d_class2[m] = source
+
+    # cleanup unneeded mmseqs outputs (keep only _cluster.tsv)
+    # mmseqs makes: out_tmp/, out_prefix_all_seqs.fasta, out_prefix_rep_seq.fasta, out_prefix_cluster.tsv
+    for extra in [out_prefix + "_all_seqs.fasta", out_prefix + "_rep_seq.fasta", all_fa]:
+        try:
+            if os.path.exists(extra):
+                os.remove(extra)
+        except Exception:
+            pass
+    try:
+        if os.path.exists(out_tmp):
+            shutil.rmtree(out_tmp)
+    except Exception:
+        pass
+
+    return d_class2
 
 class Classifier(object):
 	def __init__(self, gff=None, db='rexdb', fout=sys.stdout): # gff is sorted
@@ -994,9 +1099,6 @@ def hmm2best(inSeqs, inHmmouts, nucl_len=None, prefix=None, db='rexdb', seqtype=
 			gid = '{}:{}-{}|{}'.format(qid, nuc_start, nuc_end, rc.tname)
 			element = LTRgffLine(gffline + ({'ID':gid, 'gene':domain, 'clade':clade},))
 			order, superfamily, max_clade, coding = Classifier(db=db).classify_element([element])
-#			if order == 'Unknown':
-#				logger.warn('unknown element: {}, is excluded'.format(gid))
-#				continue
 			cls = fmt_cls(order, superfamily, max_clade)
 			nstop = list(gseq).count('*')
 			match = '{} {} {}'.format(rc.tname, rc.hmmstart, rc.hmmend)
@@ -1254,6 +1356,12 @@ class Dependency(object):
 		else:
 			return False
 
+	def check_mmseqs(self, program='mmseqs'):
+		if self.check_presence(program):
+			logger.info('{}\tOK'.format(program))
+		else:
+			logger.error('{} not found'.format(program))
+
 	def check_hmmer_verion(self, program):
 		cmd = '{} -h'.format(program)
 		out, err, status = run_cmd(cmd)
@@ -1274,6 +1382,3 @@ def lazy_decode(out):
 
 def main():
 	pipeline(Args())
-
-if __name__ == '__main__':
-	main()
