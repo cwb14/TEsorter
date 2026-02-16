@@ -123,6 +123,15 @@ def Args():
     group_element.add_argument("-nolib", "--no-library", action="store_true",
                     default=False,
                     help="do not generate a library file for RepeatMasker [default=%(default)s]")
+    group_element.add_argument(
+        "--pass2-classified-fasta",
+        action="store",
+        default=None,
+        type=str,
+        help="Optional FASTA of previously-classified elements to augment pass-2 database. "
+         "Headers must be like: >id#Order/Superfamily/Clade"
+    )
+
     group_element.add_argument("-norc", "--no-reverse", action="store_true",
                     default=False,
                     help="do not reverse complement sequences if they are detected in minus strand [default=%(default)s]")
@@ -266,6 +275,11 @@ please switch to the GENOME mode by specifiy `-genome`')
             seqtype = seq_type,
             **kargs
             )
+    # Track IDs belonging to the input fasta (sanitized the same way as elsewhere)
+    input_ids = set()
+    for rc in SeqIO.parse(open(args.sequence), 'fasta'):
+        rid = rc.id.split('#', 1)[0]
+        input_ids.add(format_gff_id(rid))
 
     mask_gff3(args.sequence, gff, args.prefix, types=args.mask, gap=gap)
     # classify
@@ -287,15 +301,26 @@ please switch to the GENOME mode by specifiy `-genome`')
         logger.info('classifying the unclassified sequences by searching against the classified ones')
         classified_seq = '{}/pass1_classified.fa'.format(args.tmp_dir)
         unclassified_seq = '{}/pass1_unclassified.fa'.format(args.tmp_dir)
-        get_records(args.sequence, classified_seq, list(d_class.keys()), type='fasta', process='get', format_id=format_gff_id)
-        get_records(args.sequence, unclassified_seq, list(d_class.keys()), type='fasta', process='remove',format_id=format_gff_id)
+
+        get_records(args.sequence, classified_seq, list(d_class.keys()),
+                    type='fasta', process='get', format_id=format_gff_id)
+        get_records(args.sequence, unclassified_seq, list(d_class.keys()),
+                    type='fasta', process='remove', format_id=format_gff_id)
+
+        # NEW: extend d_class from external classified fasta (so pass-2 hits always resolvable)
+        if args.pass2_classified_fasta:
+            extend_d_class_from_classified_fasta(d_class, args.pass2_classified_fasta)
+
+        # NEW: build a merged db fasta for mmseqs pass-2
+        classified_merged_seq = os.path.join(args.tmp_dir, "pass2_db_merged.fa")
+        merge_classified_fastas(classified_merged_seq, classified_seq, args.pass2_classified_fasta)
 
         logger.info('using the {} rule'.format(args.pass2_rule))
         m8_out = os.path.join(args.tmp_dir, "pass2.m8")
         mmseqs_tmp = os.path.join(args.tmp_dir, "mmseqs_tmp")
 
         d_class2 = classify_by_mmseqs(
-            classified_seq, unclassified_seq,
+            classified_merged_seq, unclassified_seq,
             m8_out=m8_out,
             tmpdir=mmseqs_tmp,
             seqtype=args.seq_type,
@@ -316,7 +341,10 @@ please switch to the GENOME mode by specifiy `-genome`')
             d_class[unclfed_id] = CommonClassification(*line)
         fc.close()
         logger.info('{} sequences classified in pass 2'.format(len(d_class2)))
-        logger.info('total {} sequences classified.'.format(len(d_class)))
+        total_input_classified = sum(1 for k in d_class.keys() if k in input_ids)
+        logger.info('total {} sequences classified (of {} input sequences).'.format(
+            total_input_classified, len(input_ids)
+        ))
     logger.info('see classified sequences in `{}`'.format(classify_out))
 
     # output library
@@ -352,8 +380,9 @@ please switch to the GENOME mode by specifiy `-genome`')
         rc.id = new_id
         SeqIO.write(rc, fout, 'fasta')
     fout.close()
-    logger.info('Summary of classifications:')
-    summary(d_class)
+    logger.info('Summary of classifications (input sequences only):')
+    summary(d_class, only_ids=input_ids)
+
     cleanup(args)
     logger.info( 'Pipeline done.' )
 def mask_gff3(inSeq, inRM, outPrefix, types=['hard'], **kargs):
@@ -373,12 +402,16 @@ def cleanup(args):
         logger.info( 'cleaning the temporary directory {}'.format(args.tmp_dir) )
         shutil.rmtree(args.tmp_dir)
 
-def summary(d_class):
+def summary(d_class, only_ids=None):
     d_sum = {}
     for sid, clf in d_class.items():
+        if only_ids is not None and sid not in only_ids:
+            continue
         key = (clf.order, clf.superfamily)
         d_sum[key] = [0, 0, [], 0] # #seqs, #seqs in clades, #clades, #full domains
     for sid, clf in d_class.items():
+        if only_ids is not None and sid not in only_ids:
+            continue
         key = (clf.order, clf.superfamily)
         d_sum[key][0] += 1
         if clf.clade not in {'unknown', 'mixture'}:
@@ -386,11 +419,11 @@ def summary(d_class):
             d_sum[key][2] += [clf.clade]
         if clf.completed == 'yes':
             d_sum[key][3] += 1
-    
+
     template = '{:<16}{:<16}{:>15}{:>15}{:>15}{:>15}'
     line = ['Order', 'Superfamily', '# of Sequences', '# of Clade Sequences', '# of Clades', '# of full Domains']
-
     print(template.format(*line), file=sys.stdout)
+
     for (order, superfamliy), summary in \
             sorted(list(d_sum.items()), key=lambda x: (ORDERS.index(x[0][0]), x[0][1])):
         line = [order, superfamliy, summary[0], summary[1], len(set(summary[2])), summary[3]]
@@ -405,6 +438,100 @@ def fmt_cls(*args):
             continue
         values += [arg]
     return '/'.join(values)
+
+def parse_cls_from_fasta_header(header):
+    """
+    Expected: raw_id#Order/Superfamily/Clade  (clade optional but recommended)
+    Returns: (sanitized_id, order, superfamily, clade) or None if not parseable.
+    """
+    # header may include description; keep first token like SeqIO does for .id,
+    # but be robust anyway:
+    h = header.strip()
+    if h.startswith('>'):
+        h = h[1:]
+    h = h.split(None, 1)[0]  # first token only
+
+    if '#' not in h:
+        return None
+    raw_id, cls = h.split('#', 1)
+    raw_id = format_gff_id(raw_id)
+
+    parts = cls.split('/')
+    if len(parts) < 2:
+        return None
+
+    order = parts[0] or 'Unknown'
+    superfamily = parts[1] or 'unknown'
+    clade = parts[2] if len(parts) >= 3 and parts[2] else 'unknown'
+    return raw_id, order, superfamily, clade
+
+
+def extend_d_class_from_classified_fasta(d_class, fasta_path):
+    """
+    Extend d_class with classifications parsed from a classified fasta.
+    Does NOT override existing keys (pass-1 HMM remains authoritative).
+    """
+    if fasta_path is None:
+        return
+
+    added = 0
+    skipped = 0
+    for rc in SeqIO.parse(open(fasta_path), 'fasta'):
+        parsed = parse_cls_from_fasta_header(rc.description)
+        if not parsed:
+            skipped += 1
+            continue
+        sid, order, superfamily, clade = parsed
+        if sid in d_class:
+            continue
+        # Store clade too (available), though your rescue writes clade=unknown.
+        d_class[sid] = CommonClassification(
+            sid, order, superfamily, clade, 'none', '?', 'none'
+        )
+        added += 1
+
+    logger.info(f"extended pass-1 classifications with {added} entries from {fasta_path} "
+                f"({skipped} headers skipped: not parseable)")
+
+
+def merge_classified_fastas(out_fa, fa_primary, fa_extra=None):
+    """
+    Write out_fa as a merged database for pass-2:
+    - keep records from fa_primary first
+    - add records from fa_extra if provided
+    - de-duplicate by sanitized ID (format_gff_id of raw id before '#', if present)
+    - rewrite IDs in output to the sanitized ID (no '#...') so mmseqs IDs match d_class keys
+    """
+    seen = set()
+
+    def iter_records(path):
+        for r in SeqIO.parse(open(path), 'fasta'):
+            # derive raw id from header, preferring portion before '#'
+            rid = r.id
+            if '#' in rid:
+                rid = rid.split('#', 1)[0]
+            rid = format_gff_id(rid)
+            r.id = rid
+            r.name = rid
+            r.description = ""  # keep clean ids for mmseqs
+            yield r
+
+    with open(out_fa, 'w') as fout:
+        for r in iter_records(fa_primary):
+            if r.id in seen:
+                continue
+            seen.add(r.id)
+            SeqIO.write(r, fout, 'fasta')
+
+        if fa_extra:
+            for r in iter_records(fa_extra):
+                if r.id in seen:
+                    continue
+                seen.add(r.id)
+                SeqIO.write(r, fout, 'fasta')
+
+    logger.info(f"pass-2 database FASTA written: {out_fa} ({len(seen)} unique IDs)")
+
 
 class CommonClassification(object):
     def __init__(self, id=None, order=None, superfamily=None,
@@ -1326,4 +1453,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
