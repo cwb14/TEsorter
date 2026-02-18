@@ -277,9 +277,12 @@ please switch to the GENOME mode by specifiy `-genome`')
             )
     # Track IDs belonging to the input fasta (sanitized the same way as elsewhere)
     input_ids = set()
-    for rc in SeqIO.parse(open(args.sequence), 'fasta'):
-        rid = rc.id.split('#', 1)[0]
-        input_ids.add(format_gff_id(rid))
+    with open(args.sequence, "rt") as fh:
+        for line in fh:
+            if line.startswith(">"):
+                h = line[1:].strip().split(None, 1)[0]
+                rid = h.split("#", 1)[0]
+                input_ids.add(format_gff_id(rid))
 
     mask_gff3(args.sequence, gff, args.prefix, types=args.mask, gap=gap)
     # classify
