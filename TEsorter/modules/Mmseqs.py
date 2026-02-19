@@ -12,7 +12,12 @@ def mmseqs_easy_search(db_seq, qry_seq, out_m8, tmpdir,
     Run mmseqs easy-search and write a BLAST-tab-like file.
     We request a custom format to make parsing easy.
     """
+
     os.makedirs(tmpdir, exist_ok=True)
+
+    cleaned_qry = os.path.join(tmpdir, "query.cleaned.fa")
+    clean_fasta_atcg_only(qry_seq, cleaned_qry)
+    qry_seq = cleaned_qry
 
     # search-type: 3 nucleotide; 1 amino-acid
     if seqtype == "nucl":
@@ -40,6 +45,36 @@ def mmseqs_easy_search(db_seq, qry_seq, out_m8, tmpdir,
     run_cmd(cmd, logger=logger)
     return out_m8
 
+def clean_fasta_atcg_only(in_fa, out_fa):
+    """
+    Remove all non-ATCG characters from sequences in a FASTA file.
+    Keeps headers unchanged.
+    """
+    with open(in_fa) as fin, open(out_fa, "w") as fout:
+        seq_buf = []
+        header = None
+
+        def flush():
+            if header is None:
+                return
+            seq = "".join(seq_buf).upper()
+            seq = "".join([b for b in seq if b in ("A", "T", "C", "G")])
+            fout.write(header + "\n")
+            fout.write(seq + "\n")
+
+        for line in fin:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+
+            if line.startswith(">"):
+                flush()
+                header = line
+                seq_buf = []
+            else:
+                seq_buf.append(line)
+
+        flush()
 
 class MmseqsM8Record:
     __slots__ = ("qseqid", "sseqid", "fident", "alnlen", "qlen", "qcov", "bits")
