@@ -58,6 +58,26 @@ DB = {
 ORDERS = ['LTR', 'pararetrovirus', 'DIRS', 'Penelope', 'LINE', 'SINE', 
           'TIR', 'Helitron', 'Maverick', 'mixture', 'Unknown', 'Total']
 
+# ---------------------------------------------------------------------------
+# Sequence cleaning helpers
+# ---------------------------------------------------------------------------
+_ATCG_RE = re.compile(r'[^ATCGatcg]')
+
+def clean_atcg(seq):
+    """Remove all non-ATCG characters from a sequence string."""
+    return _ATCG_RE.sub('', str(seq))
+
+def clean_fasta_atcg(path):
+    """Rewrite a FASTA file in-place, stripping non-ATCG characters from sequences."""
+    tmp = path + '.atcg_clean.tmp'
+    with open(path, 'rt') as fin, open(tmp, 'w') as fout:
+        for rc in SeqIO.parse(fin, 'fasta'):
+            rc.seq = rc.seq.__class__(clean_atcg(rc.seq))
+            SeqIO.write(rc, fout, 'fasta')
+    os.replace(tmp, path)
+    logger.info(f'non-ATCG characters removed from {path}')
+# ---------------------------------------------------------------------------
+
 
 def Args():
     parser = argparse.ArgumentParser(
@@ -149,8 +169,6 @@ def Args():
                     help="overlap size of windows [default=%(default)s]")
                     
     args = parser.parse_args()
-#   if args.prefix is None:
-#       args.prefix = '{}.{}'.format(os.path.basename(args.sequence), args.hmm_database)
 
     if args.citation:
         print_citation()
@@ -162,8 +180,6 @@ def Args():
     if not args.disable_pass2:
         for key, par in zip(['p2_identity', 'p2_coverage', 'p2_length'], args.pass2_rule.split('-')):
             setattr(args, key, float(par))
-#   if args.hmm_database:
-#       args.seq_type = 'prot'
     return args
 
 def print_citation():
@@ -187,24 +203,17 @@ Yuan YW, Wessler SR. The catalytic domain of all eukaryotic cut-and-paste transp
 ''')
 
 def check_db(full_path):
-#   folder_path = os.path.dirname(full_path)
-#   if folder_path == '':
-#       folder_path = '.'
-    data_file = os.path.basename(full_path)
-#   logger.info( 'db path: '+folder_path )
     logger.info( 'db file: '+ full_path )
 
     if not os.path.exists(full_path):
         logger.error( 'db file: '+full_path+' does not exist!' )
         sys.exit()
     else:
-#       for root, dirs, files in os.walk(folder_path):
         if os.path.exists(full_path+".h3i"):
-            logger.info(data_file+'\tOK')
+            logger.info(os.path.basename(full_path)+'\tOK')
         else:
-            logger.info( 'db '+data_file+' not yet ready, building db!' )
+            logger.info( 'db '+os.path.basename(full_path)+' not yet ready, building db!' )
             command = "hmmpress -f "+full_path
-            #Execute the command
             process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
             stdout, stderr = process.communicate()
             logger.info(lazy_decode(stdout))
@@ -220,8 +229,6 @@ def pipeline(args):
     if args.db_hmm is not None:
         db_file = args.db_hmm
         db_name = os.path.splitext(os.path.basename(db_file))[0]
-#   if args.db_name is not None:
-#       db_name = args.db_name
     if args.prefix is None:
         args.prefix = '{}.{}'.format(os.path.basename(args.sequence), db_name)
     Dependency().check_hmmer(db=db_file)
@@ -249,8 +256,6 @@ def pipeline(args):
 
     if args.genome:
         logger.info( 'Start identifying pipeline (GENOME mode)' )
-        #print(open(args.sequence))
-        #print([(rc.id, len(rc.seq)) for rc in SeqIO.parse(open(args.sequence), 'fasta')])
         seq_type = 'nucl'
         gff, geneSeq = genomeAnn(genome=args.sequence, 
             window_size=args.win_size, window_ovl=args.win_ovl, 
@@ -260,7 +265,7 @@ def pipeline(args):
         mask_gff3(args.sequence, gff, args.prefix, types=args.mask, gap=gap)
         cleanup(args)
         logger.info( 'Pipeline done.' )
-        return  # genome mode stop at here
+        return
     logger.info( 'Start classifying pipeline (ELEMENT mode)' )
     lens = [len(rc.seq) for rc in SeqIO.parse(open(args.sequence), 'fasta')]
     if max(lens) > 1e6:
@@ -268,14 +273,13 @@ def pipeline(args):
 please switch to the GENOME mode by specifiy `-genome`')
     seq_num = len(lens)
     logger.info('total {} sequences'.format(seq_num))
-    # search against DB and parse
     seq_type = 'prot' if db_name == 'sine' else args.seq_type
     gff, geneSeq = LTRlibAnn(
             ltrlib = args.sequence,
             seqtype = seq_type,
             **kargs
             )
-    # Track IDs belonging to the input fasta (sanitized the same way as elsewhere)
+    # Track IDs belonging to the input fasta
     input_ids = set()
     with open(args.sequence, "rt") as fh:
         for line in fh:
@@ -310,13 +314,19 @@ please switch to the GENOME mode by specifiy `-genome`')
         get_records(args.sequence, unclassified_seq, list(d_class.keys()),
                     type='fasta', process='remove', format_id=format_gff_id)
 
-        # NEW: extend d_class from external classified fasta (so pass-2 hits always resolvable)
+        # Strip non-ATCG characters from pass-1 output FASTAs
+        if args.seq_type == 'nucl':
+            clean_fasta_atcg(classified_seq)
+            clean_fasta_atcg(unclassified_seq)
+
+        # extend d_class from external classified fasta
         if args.pass2_classified_fasta:
             extend_d_class_from_classified_fasta(d_class, args.pass2_classified_fasta)
 
-        # NEW: build a merged db fasta for mmseqs pass-2
+        # build a merged db fasta for mmseqs pass-2
         classified_merged_seq = os.path.join(args.tmp_dir, "pass2_db_merged.fa")
-        merge_classified_fastas(classified_merged_seq, classified_seq, args.pass2_classified_fasta)
+        merge_classified_fastas(classified_merged_seq, classified_seq, args.pass2_classified_fasta,
+                                clean_nucl=(args.seq_type == 'nucl'))
 
         logger.info('using the {} rule'.format(args.pass2_rule))
         m8_out = os.path.join(args.tmp_dir, "pass2.m8")
@@ -331,7 +341,6 @@ please switch to the GENOME mode by specifiy `-genome`')
             min_identtity=args.p2_identity,
             min_coverge=args.p2_coverage,
             min_length=args.p2_length,
-            # sensitivity=4.0,  # optional “fast” preset
         )
 
         fc = open(classify_out, 'a')
@@ -340,7 +349,6 @@ please switch to the GENOME mode by specifiy `-genome`')
             order, superfamily, clade = clfed.order, clfed.superfamily, 'unknown'
             line = [unclfed_id, order, superfamily, clade, 'none', '?', 'none']
             print('\t'.join(line), file=fc)
-            # update
             d_class[unclfed_id] = CommonClassification(*line)
         fc.close()
         logger.info('{} sequences classified in pass 2'.format(len(d_class2)))
@@ -374,7 +382,6 @@ please switch to the GENOME mode by specifiy `-genome`')
     fout = open(pep_lib, 'w')
     for rc in SeqIO.parse(geneSeq, 'fasta'):
         raw_id = '|'.join(rc.id.split('|')[:-1])
-        #assert raw_id in d_class
         cl = d_class[raw_id]
         cl = fmt_cls(cl.order, cl.superfamily, cl.clade)
         d_desc = dict([pair.split('=', 1)for pair in rc.description.split()[-1].split(';')])
@@ -388,6 +395,7 @@ please switch to the GENOME mode by specifiy `-genome`')
 
     cleanup(args)
     logger.info( 'Pipeline done.' )
+
 def mask_gff3(inSeq, inRM, outPrefix, types=['hard'], **kargs):
     if not types:
         return
@@ -399,8 +407,8 @@ def mask_gff3(inSeq, inRM, outPrefix, types=['hard'], **kargs):
         with open(outSeqfile, 'w') as outSeq:
             masked, total = mask(inSeq, inRM, outSeq, soft=soft, **kargs)
     logger.info('{} / {} ({:.2%}) masked'.format(masked, total, masked/total))
+
 def cleanup(args):
-    # clean up
     if not args.no_cleanup:
         logger.info( 'cleaning the temporary directory {}'.format(args.tmp_dir) )
         shutil.rmtree(args.tmp_dir)
@@ -411,7 +419,7 @@ def summary(d_class, only_ids=None):
         if only_ids is not None and sid not in only_ids:
             continue
         key = (clf.order, clf.superfamily)
-        d_sum[key] = [0, 0, [], 0] # #seqs, #seqs in clades, #clades, #full domains
+        d_sum[key] = [0, 0, [], 0]
     for sid, clf in d_class.items():
         if only_ids is not None and sid not in only_ids:
             continue
@@ -443,16 +451,10 @@ def fmt_cls(*args):
     return '/'.join(values)
 
 def parse_cls_from_fasta_header(header):
-    """
-    Expected: raw_id#Order/Superfamily/Clade  (clade optional but recommended)
-    Returns: (sanitized_id, order, superfamily, clade) or None if not parseable.
-    """
-    # header may include description; keep first token like SeqIO does for .id,
-    # but be robust anyway:
     h = header.strip()
     if h.startswith('>'):
         h = h[1:]
-    h = h.split(None, 1)[0]  # first token only
+    h = h.split(None, 1)[0]
 
     if '#' not in h:
         return None
@@ -470,10 +472,6 @@ def parse_cls_from_fasta_header(header):
 
 
 def extend_d_class_from_classified_fasta(d_class, fasta_path):
-    """
-    Extend d_class with classifications parsed from a classified fasta.
-    Does NOT override existing keys (pass-1 HMM remains authoritative).
-    """
     if fasta_path is None:
         return
 
@@ -487,7 +485,6 @@ def extend_d_class_from_classified_fasta(d_class, fasta_path):
         sid, order, superfamily, clade = parsed
         if sid in d_class:
             continue
-        # Store clade too (available), though your rescue writes clade=unknown.
         d_class[sid] = CommonClassification(
             sid, order, superfamily, clade, 'none', '?', 'none'
         )
@@ -497,26 +494,24 @@ def extend_d_class_from_classified_fasta(d_class, fasta_path):
                 f"({skipped} headers skipped: not parseable)")
 
 
-def merge_classified_fastas(out_fa, fa_primary, fa_extra=None):
+def merge_classified_fastas(out_fa, fa_primary, fa_extra=None, clean_nucl=True):
     """
-    Write out_fa as a merged database for pass-2:
-    - keep records from fa_primary first
-    - add records from fa_extra if provided
-    - de-duplicate by sanitized ID (format_gff_id of raw id before '#', if present)
-    - rewrite IDs in output to the sanitized ID (no '#...') so mmseqs IDs match d_class keys
+    Write out_fa as a merged database for pass-2.
+    If clean_nucl=True, strip non-ATCG characters from sequences before writing.
     """
     seen = set()
 
     def iter_records(path):
         for r in SeqIO.parse(open(path), 'fasta'):
-            # derive raw id from header, preferring portion before '#'
             rid = r.id
             if '#' in rid:
                 rid = rid.split('#', 1)[0]
             rid = format_gff_id(rid)
             r.id = rid
             r.name = rid
-            r.description = ""  # keep clean ids for mmseqs
+            r.description = ""
+            if clean_nucl:
+                r.seq = r.seq.__class__(clean_atcg(r.seq))
             yield r
 
     with open(out_fa, 'w') as fout:
@@ -533,7 +528,8 @@ def merge_classified_fastas(out_fa, fa_primary, fa_extra=None):
                 seen.add(r.id)
                 SeqIO.write(r, fout, 'fasta')
 
-    logger.info(f"pass-2 database FASTA written: {out_fa} ({len(seen)} unique IDs)")
+    logger.info(f"pass-2 database FASTA written: {out_fa} ({len(seen)} unique IDs)"
+                + (" [non-ATCG stripped]" if clean_nucl else ""))
 
 
 class CommonClassification(object):
@@ -546,6 +542,7 @@ class CommonClassification(object):
         self.completed = completed
         self.strand = strand
         self.domains = domains
+
 class CommonClassifications:
     def __init__(self, clsfile):
         self.clsfile = clsfile
@@ -562,10 +559,6 @@ class CommonClassifications:
 def classify_by_mmseqs(db_seq, qry_seq, m8_out=None, seqtype="nucl", ncpu=4,
                        min_identtity=80, min_coverge=80, min_length=80,
                        tmpdir=None, sensitivity=None):
-    """
-    pass-2 classify using MMseqs2 easy-search.
-    Returns OrderedDict(query_id -> best_target_id) after filtering.
-    """
     if os.path.getsize(db_seq) == 0:
         return {}
 
@@ -575,11 +568,9 @@ def classify_by_mmseqs(db_seq, qry_seq, m8_out=None, seqtype="nucl", ncpu=4,
     if m8_out is None:
         m8_out = qry_seq + ".mmseqs.m8"
 
-    # thresholds: BLAST used percent (0..100)
     min_seq_id = float(min_identtity) / 100.0
     min_cov = float(min_coverge) / 100.0
 
-    # write the raw results
     mmseqs_easy_search(
         db_seq=db_seq,
         qry_seq=qry_seq,
@@ -589,14 +580,13 @@ def classify_by_mmseqs(db_seq, qry_seq, m8_out=None, seqtype="nucl", ncpu=4,
         ncpu=ncpu,
         min_seq_id=min_seq_id,
         min_cov=min_cov,
-        cov_mode=2,               # coverage of query
+        cov_mode=2,
         min_aln_len=int(min_length),
-        sensitivity=sensitivity,  # optional, e.g. 5.7 default, or 4.0 faster
+        sensitivity=sensitivity,
     )
 
     d_best = parse_mmseqs_m8_besthit(m8_out)
 
-    # extra safety filter (in case mmseqs options change / are permissive)
     filtered = OrderedDict()
     for qid, rc in d_best.items():
         if (rc.fident >= min_seq_id and rc.qcov >= min_cov and rc.alnlen >= min_length):
@@ -606,7 +596,7 @@ def classify_by_mmseqs(db_seq, qry_seq, m8_out=None, seqtype="nucl", ncpu=4,
 
 
 class Classifier(object):
-    def __init__(self, gff=None, db='rexdb', fout=sys.stdout): # gff is sorted
+    def __init__(self, gff=None, db='rexdb', fout=sys.stdout):
         self.gff = gff
         self.db = db
         self.fout = fout
@@ -666,8 +656,6 @@ class Classifier(object):
         return order, superfamily, max_clade, coding
     def identify_rexdb(self, genes, clades):
         perfect_structure = {
-#            ('LTR', 'Copia'): ['Ty1-GAG', 'Ty1-PROT', 'Ty1-INT', 'Ty1-RT', 'Ty1-RH'],
-#            ('LTR', 'Gypsy'): ['Ty3-GAG', 'Ty3-PROT', 'Ty3-RT', 'Ty3-RH', 'Ty3-INT'],
             ('LTR', 'Copia'): ['GAG', 'PROT', 'INT', 'RT', 'RH'],
             ('LTR', 'Gypsy'): ['GAG', 'PROT', 'RT', 'RH', 'INT'],
             ('LTR', 'Bel-Pao'): ['GAG', 'PROT', 'RT', 'RH', 'INT'],
@@ -690,33 +678,33 @@ class Classifier(object):
             ordered_genes = perfect_structure[(order, superfamily)]
             my_genes = [gene for gene in genes if gene in set(ordered_genes)]
             if ordered_genes == my_genes:
-                coding = 'yes' # completed gene structure
+                coding = 'yes'
             else:
                 coding = 'no'
         except KeyError:
             coding = 'unknown'
         if superfamily not in {'Copia', 'Gypsy'}:
             max_clade = 'unknown'
-        if max_clade.startswith('Ty'): # Ty3_gypsy, Ty1_copia, Ty1-outgroup in metazoa_v3
+        if max_clade.startswith('Ty'):
             max_clade = 'unknown'
         return order, superfamily, max_clade, coding
-    def _parse_rexdb(self, clade): # full clade name
+    def _parse_rexdb(self, clade):
         if clade.startswith('Class_I/LTR/Ty1_copia'):
             order, superfamily = 'LTR', 'Copia'
         elif clade.startswith('Class_I/LTR/Ty3_gypsy'):
             order, superfamily = 'LTR', 'Gypsy'
-        elif clade.startswith('Class_I/LTR/'): # LTR/Bel-Pao, LTR/Retrovirus
+        elif clade.startswith('Class_I/LTR/'):
             order, superfamily = clade.split('/')[1:3]
-        elif clade.startswith('Class_I/'): # LINE, pararetrovirus, Penelope, DIRS
+        elif clade.startswith('Class_I/'):
             try: order, superfamily = clade.split('/')[1:3]
             except ValueError: order, superfamily = clade.split('/')[1], 'unknown'
-        elif clade.startswith('Class_II/'): # TIR/hAT, Helitro, Maverick
+        elif clade.startswith('Class_II/'):
             try: order, superfamily = clade.split('/')[2:4]
             except ValueError: order, superfamily = clade.split('/')[2], 'unknown'
-        elif clade.startswith('NA'): # "NA:Retrovirus-RH"
+        elif clade.startswith('NA'):
             order, superfamily = 'LTR', 'Retrovirus'
-        else:   # not get it
-            logger.warning( 'unknown clade: {}'.format(max_clade) )
+        else:
+            logger.warning( 'unknown clade: {}'.format(clade) )
         return order, superfamily
     def identify_gydb(self, genes, clades):
         perfect_structure = {
@@ -748,7 +736,7 @@ class Classifier(object):
             ordered_genes = perfect_structure[(order, superfamily)]
             my_genes = [gene for gene in genes if gene in set(ordered_genes)]
             if ordered_genes == my_genes:
-                coding = 'yes' # completed gene structure and the same order
+                coding = 'yes'
             else:
                 coding = 'no'
         except KeyError:
@@ -762,7 +750,7 @@ class Classifier(object):
                 intid = rc.id.split('#')[0]
             else:
                 try: intid = idmap[rc.id.split('#')[0]]
-                except KeyError as e:   # this should be rare
+                except KeyError as e:
                     logger.warn( 'skipped KeyError: {}'.format(e) )
             if intid in d_class:
                 neword, newfam = d_class[intid]
@@ -818,9 +806,9 @@ class CladeInfo():
             else:
                 self.clade = self.dict['Clade']
             self.superfamily = self.dict['Family'].split('/')[-1]
-            if self.superfamily == 'Retroviridae':  # deltaretroviridae gammaretroviridae
+            if self.superfamily == 'Retroviridae':
                 self.clade = self.dict['Cluster_or_genus'].replace('virus', 'viridae')
-            if self.superfamily == 'Retrovirus':    # an exception
+            if self.superfamily == 'Retrovirus':
                 self.superfamily = 'Retroviridae'
             self.order = 'LTR' if self.dict['System'] in {'LTR_retroelements', 'LTR_Retroelements', 'LTR_retroid_elements'} else self.dict['System']
             yield self
@@ -828,16 +816,16 @@ class CladeInfo():
                 self.clade = self.clade_map[self.clade]
                 yield self
                 if self.clade == '412_mdg1':
-                    self.clade = '412-mdg1'  # 412-mdg1 and 412_mdg1
+                    self.clade = '412-mdg1'
                     yield self
 
-            self.clade = self.clade.replace('-', '_') # A-clade V-clade C-clade
+            self.clade = self.clade.replace('-', '_')
             yield self
             self.clade = self.clade.lower()
             yield self
-        self.order, self.superfamily, self.clade, self.dict = ['LTR', 'Copia', 'ty1/copia', {}]  # AP_ty1/copia
+        self.order, self.superfamily, self.clade, self.dict = ['LTR', 'Copia', 'ty1/copia', {}]
         yield self
-        order_map = {   # some unknown clade
+        order_map = {
             'retroelement': 'LTR',
             'retroviridae': 'LTR',
             'B-type_betaretroviridae': 'LTR',
@@ -858,7 +846,7 @@ class CladeInfo():
             'pepsins_A1b': 'Unknown',
             }
         for clade, order in list(order_map.items()):
-            self.order, self.superfamily, self.clade, self.dict = [order, 'unknown', clade, {}]  # CHR_retroelement
+            self.order, self.superfamily, self.clade, self.dict = [order, 'unknown', clade, {}]
             yield self
 
 class GffLine(object):
@@ -924,26 +912,26 @@ class HmmDomRecord(object):
         return round(1e2*(self.hmmend - self.hmmstart + 1) / self.tlen, 1)
 
 
-
 def parse_hmmname(hmmname, db='gydb'):
     db = db.lower()
     if db == 'gydb':
         temp = hmmname.split('_')
         gene, clade = temp[0], '_'.join(temp[1:])
-    elif db.startswith('rexdb'):    # Class_I/LTR/Ty3_gypsy/chromovirus/Tekay:Ty3-RT
-        gene = hmmname.split(':')[1] #.split('-')[1]
+    elif db.startswith('rexdb'):
+        gene = hmmname.split(':')[1]
         clade = hmmname.split(':')[0].split('/')[-1]
     elif db.startswith('pfam'):
         gene = hmmname
         clade = hmmname
     elif db.startswith('sine'):
-        gene = 'SINE' #hmmname
+        gene = 'SINE'
         clade = 'SINE'
     else:
         gene, clade = hmmname, hmmname
     return gene, clade
+
 class HmmCluster(object):
-    def __int__(self, hmmout, seqtype = 'nucl'): # only for nucl
+    def __int__(self, hmmout, seqtype = 'nucl'):
         self.hmmout = hmmout
         self.seqtype = seqtype
 
@@ -966,7 +954,7 @@ class HmmCluster(object):
         records = sorted(records, key=lambda x:x.hmmstart)
         best_idx, best_rc = self.maxscore(records)
         new_rcs = [best_rc]
-        for rc in records[:best_idx][::-1]:     # <<- left extand
+        for rc in records[:best_idx][::-1]:
             right_rc = new_rcs[0]
             mal_pos = right_rc.hmmstart - rc.hmmend
             if abs(mal_pos) <= max_mal:
@@ -975,7 +963,7 @@ class HmmCluster(object):
                     rc.hmmend -= diff
                     rc.alnend -= diff
                 new_rcs = [rc] + new_rcs
-        for rc in records[best_idx:]:           # ->> right extand
+        for rc in records[best_idx:]:
             left_rc = new_rcs[-1]
             mal_pos = rc.hmmstart - left_rc.hmmend
             if abs(mal_pos) <= max_mal:
@@ -1014,51 +1002,45 @@ def multi(*n):
     return result
 
 def group_resolve_overlaps(lines):
-    '''assume multiple chromsomes'''
     resolved_lines = []
     for chrom, items in itertools.groupby(lines, key=lambda x:x[0]):
         logger.info('resolving overlaps in {}'.format(chrom))
         resolved_lines += resolve_overlaps(list(items))
     return resolved_lines
+
 def overlap(self, other):
-    # gff line: gffline = [qid, 'TEsorter', 'CDS', nuc_start, nuc_end, rc.score, strand, frame, attr
     ovl = max(0, min(self[4], other[4]) - max(self[3], other[3]))
     return 100*ovl/(min((self[4]-self[3]+1), (other[4]-other[3]+1)))
     
 def resolve_overlaps(lines, max_ovl=20, ):
-    '''assume only one chromsome'''
     last_line = None
     discards = []
     ie, io = 0, 0
     for line in sorted(lines, key=lambda x:x[3]):
         discard = None
-    #   print(last_line, line)
         if last_line:
-            if line == last_line:   # equal
+            if line == last_line:
                 ie += 1
-                line_pair = [last_line, line]   # retain, discard
+                line_pair = [last_line, line]
             else:
                 if overlap(line, last_line) > max_ovl:
                     io += 1
-                    if line[5] > last_line[5]:  # score is prior
+                    if line[5] > last_line[5]:
                         line_pair = [line, last_line]
                     else: 
                         line_pair = [last_line, line]
-                else:   # no overlap or too short overlap
+                else:
                     last_line = line
                     continue
             
             retain, discard = line_pair
-
             discards += [discard]
 
         if not last_line or discard != line:
             last_line = line
-#   logger.info('discard {} equal and {} overlapped hits; {} in total'.format(ie, io, ie+io))
     return sorted(set(lines) - set(discards), key=lambda x:x[3])
 
 def _hmm2best(inHmmouts, db='rexdb', seqtype='nucl', genome=False):
-    '''best HMM hit based on score'''
     d_besthit = {}
     for inHmmout in inHmmouts:
         for rc in HmmScan(inHmmout):
@@ -1071,7 +1053,6 @@ def _hmm2best(inHmmouts, db='rexdb', seqtype='nucl', genome=False):
             key = (qid,)
             if genome:
                 key += (rc.envstart, rc.envend)
-            # normlize score
             rc.score = round(rc.domscore / rc.tlen, 2)
             rc.evalue = rc.ievalue
                 
@@ -1088,11 +1069,11 @@ def _hmm2best(inHmmouts, db='rexdb', seqtype='nucl', genome=False):
                         best_domain, _ = parse_hmmname(best_rc.tname, db=db)
                         if domain == best_domain:
                             d_besthit[key] = rc
-                        elif rc.envstart <= best_rc.envend and rc.envend >= best_rc.envstart: # overlap
+                        elif rc.envstart <= best_rc.envend and rc.envend >= best_rc.envstart:
                             d_besthit[key] = rc
                 else:
                     d_besthit[key] = rc
-            else: # gydb
+            else:
                 key += (domain,)
                 if key in d_besthit:
                     if rc.score > d_besthit[key].score:
@@ -1107,10 +1088,8 @@ def seqs2dict(inSeqs):
         for rc in SeqIO.parse(inSeq, 'fasta'):
             d[rc.id] = rc
     return d
-    #return dict([(rc.id, rc) for rc in SeqIO.parse(inSeq, 'fasta') for inSeq in inSeqs])
 
 def format_gff_id(id):
-#   return id.replace(';', '_').replace('=', '_')
     return re.compile(r'[;=\|]').sub("_", id)
 
 def hmm2best(inSeqs, inHmmouts, nucl_len=None, prefix=None, db='rexdb', seqtype='nucl', 
@@ -1135,7 +1114,6 @@ def hmm2best(inSeqs, inHmmouts, nucl_len=None, prefix=None, db='rexdb', seqtype=
         if db.startswith('rexdb'):
             domain = gene.split('-')[1]
         gid = '{}|{}'.format(format_gff_id(qid), rc.tname)
-        #gid = '{}|{}'.format(qid, rc.tname)
         try: gseq = d_seqs[rc.qname].seq[rc.envstart-1:rc.envend]
         except KeyError as e:
             raise KeyError('{}\nIt seems that the HMM domtbl file is not consistent with the sequence file. Please retry with `-fw`.')
@@ -1149,7 +1127,7 @@ def hmm2best(inSeqs, inHmmouts, nucl_len=None, prefix=None, db='rexdb', seqtype=
                 nucl_length = nucl_len[qid]
                 nuc_start = nucl_length - (rc.envend * 3 + frame) + 1
                 nuc_end = nucl_length - ((rc.envstart-1) * 3 + frame)
-            else:   # not translated
+            else:
                 nuc_start = rc.envstart
                 nuc_end = rc.envend
         elif seqtype == 'prot':
@@ -1167,9 +1145,6 @@ def hmm2best(inSeqs, inHmmouts, nucl_len=None, prefix=None, db='rexdb', seqtype=
             gid = '{}:{}-{}|{}'.format(qid, nuc_start, nuc_end, rc.tname)
             element = LTRgffLine(gffline + ({'ID':gid, 'gene':domain, 'clade':clade},))
             order, superfamily, max_clade, coding = Classifier(db=db).classify_element([element])
-#           if order == 'Unknown':
-#               logger.warn('unknown element: {}, is excluded'.format(gid))
-#               continue
             cls = fmt_cls(order, superfamily, max_clade)
             nstop = list(gseq).count('*')
             match = '{} {} {}'.format(rc.tname, rc.hmmstart, rc.hmmend)
@@ -1182,12 +1157,6 @@ def hmm2best(inSeqs, inHmmouts, nucl_len=None, prefix=None, db='rexdb', seqtype=
     
     gff, seq, tsv = '{}.dom.gff3'.format(prefix), '{}.dom.faa'.format(prefix), '{}.dom.tsv'.format(prefix)
     
-    # with open(gff+'.debug', 'w') as f:
-        # for line in sorted(lines, key=lambda x: (x[0], x[-3], x[3])):
-            # gffline = line[:9]
-            # gffline = list(map(str, gffline))
-            # print('\t'.join(gffline), file=f)
-            
     if genome:
         lines = group_resolve_overlaps(sorted(lines, key=lambda x: x[0]))
     else:
@@ -1211,6 +1180,7 @@ def hmm2best(inSeqs, inHmmouts, nucl_len=None, prefix=None, db='rexdb', seqtype=
     fgff.close()
     fseq.close()
     return gff, seq
+
 def summary_genome(gff, fout=sys.stdout):
     last_chr, last_end = '', 0
     d_stats = {}
@@ -1245,6 +1215,7 @@ def summary_genome(gff, fout=sys.stdout):
         line = cls + [n, total, mean]
         line = map(str, line)
         fout.write('\t'.join(line)+'\n')
+
 def translate(inSeq, prefix=None, overwrite=True):
     if prefix is None:
         prefix = inSeq
@@ -1273,6 +1244,7 @@ def hmmscan(inSeq, hmmdb='rexdb.hmm', hmmout=None, ncpu=4, bin='hmmscan'):
             ncpu, hmmout, hmmdb, inSeq)
     run_cmd(cmd, logger=logger)
     return hmmout
+
 def _translate(arg):
     inSeq, overwrite = arg
     return translate(inSeq, overwrite=overwrite)
@@ -1291,7 +1263,7 @@ def hmmscan_pp(inSeq, hmmdb='rexdb.hmm', hmmout=None, tmpdir='./tmp', processors
         chunk_files = [chunk_file for chunk_file in chunk_files if os.path.getsize(chunk_file)>0]
     else:
         chunk_files = [inSeq]
-    if seqtype == 'nucl':   #translate
+    if seqtype == 'nucl':
         iterable = ((chunk, overwrite) for chunk in chunk_files)
         chunk_files = list(pool_func(_translate, iterable, processors=processors))
     
@@ -1309,13 +1281,13 @@ def hmmscan_pp(inSeq, hmmdb='rexdb.hmm', hmmout=None, tmpdir='./tmp', processors
         if not status == 0:
             logger.warning( "exit code {} for CMD '{}'".format(status, cmd) )
             logger.warning('\n\tSTDOUT:\n{0}\n\tSTDERR:\n{1}\n\n'.format(stdout, stderr))
-    # cat files
     
     with open(hmmout, 'w') as f:
         for domtbl_file in domtbl_files:
             for line in open(domtbl_file):
                 f.write(line)
     return chunk_files
+
 def genomeAnn(genome, tmpdir='./tmp', seqfmt='fasta',window_size=1e6, window_ovl=1e5, **kargs):
     cutSeq = '{}/cut.{}'.format(tmpdir, seqfmt)
     with open(cutSeq, 'w') as f:
@@ -1360,13 +1332,13 @@ def replaceCls(ltrlib, seqtype='nucl', db='rexdb'):
     fann.close()
     flib.close()
 
-def parse_frame(string):    # frame=0-2
+def parse_frame(string):
     if string.startswith('rev'):
         strand = '-'
     elif string.startswith('aa'):
         strand = '+'
     else:
-        return '.', '.' #None,None
+        return '.', '.'
     frame = int(string[-1]) -1
     return strand, frame
 
@@ -1426,12 +1398,12 @@ class Dependency(object):
             return True
         else:
             return False
+
     def check_mmseqs(self, program="mmseqs"):
         if self.check_presence(program):
             logger.info(f"{program}\tOK")
         else:
             logger.error(f"{program} not found")
-
 
     def check_hmmer_verion(self, program):
         cmd = '{} -h'.format(program)
