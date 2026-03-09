@@ -319,14 +319,26 @@ please switch to the GENOME mode by specifiy `-genome`')
             clean_fasta_atcg(classified_seq)
             clean_fasta_atcg(unclassified_seq)
 
-        # extend d_class from external classified fasta
-        if args.pass2_classified_fasta:
+
+# Update pass2-classified-fasta headers using pass-1 results
+        updated_pass2_fasta = update_classified_fasta_headers(
+            args.pass2_classified_fasta, d_class, args.tmp_dir
+        )
+
+        # extend d_class from (updated) external classified fasta
+        if updated_pass2_fasta:
+            extend_d_class_from_classified_fasta(d_class, updated_pass2_fasta)
+        elif args.pass2_classified_fasta:
             extend_d_class_from_classified_fasta(d_class, args.pass2_classified_fasta)
 
         # build a merged db fasta for mmseqs pass-2
         classified_merged_seq = os.path.join(args.tmp_dir, "pass2_db_merged.fa")
-        merge_classified_fastas(classified_merged_seq, classified_seq, args.pass2_classified_fasta,
-                                clean_nucl=(args.seq_type == 'nucl'))
+
+        merge_classified_fastas(
+                    classified_merged_seq, classified_seq,
+                    updated_pass2_fasta or args.pass2_classified_fasta,
+                    clean_nucl=(args.seq_type == 'nucl')
+                )
 
         logger.info('using the {} rule'.format(args.pass2_rule))
         m8_out = os.path.join(args.tmp_dir, "pass2.m8")
@@ -531,6 +543,62 @@ def merge_classified_fastas(out_fa, fa_primary, fa_extra=None, clean_nucl=True):
     logger.info(f"pass-2 database FASTA written: {out_fa} ({len(seen)} unique IDs)"
                 + (" [non-ATCG stripped]" if clean_nucl else ""))
 
+
+_COORD_HEADER_RE = re.compile(
+    r'^(?P<id>\S+?:\d+[-\.]+\d+)#(?P<order>[^/]+)/(?P<sfam>[^/]+)/(?P<clade>\S+)$'
+)
+
+def update_classified_fasta_headers(fasta_path, d_class, tmpdir):
+    """
+    Rewrite --pass2-classified-fasta so that headers whose classification
+    contains 'unknown' fields are upgraded with pass-1 results from d_class.
+
+    Only headers matching  >id#Order/Superfamily/Clade  where *id* looks like
+    chr:start-end  AND  at least one of Order/Superfamily/Clade is 'unknown'
+    are candidates.  If the coordinate-based id is found in d_class the
+    unknowns are replaced with the richer annotation.
+
+    Returns the path to the (possibly rewritten) FASTA.
+    """
+    if fasta_path is None:
+        return None
+
+    updated_path = os.path.join(tmpdir, "pass2_classified_updated.fa")
+    n_updated = 0
+
+    with open(fasta_path, 'rt') as fin, open(updated_path, 'w') as fout:
+        for rc in SeqIO.parse(fin, 'fasta'):
+            header = rc.description.split(None, 1)[0]
+            if '#' in header:
+                raw_id_part, cls_part = header.split('#', 1)
+                rid = format_gff_id(raw_id_part)
+
+                m = _COORD_HEADER_RE.match(header)
+                if m and rid in d_class:
+                    old_order = m.group('order')
+                    old_sfam  = m.group('sfam')
+                    old_clade = m.group('clade')
+
+                    if 'unknown' in (old_order.lower(), old_sfam.lower(), old_clade.lower()):
+                        cls = d_class[rid]
+                        new_order = cls.order
+                        new_sfam  = cls.superfamily
+                        new_clade = cls.clade
+
+                        new_cls = '{}/{}/{}'.format(new_order, new_sfam, new_clade)
+                        new_header = '{}#{}'.format(raw_id_part, new_cls)
+                        rc.id = new_header
+                        rc.name = new_header
+                        rc.description = new_header
+                        n_updated += 1
+
+            SeqIO.write(rc, fout, 'fasta')
+
+    logger.info(
+        f"updated {n_updated} headers in pass2-classified-fasta "
+        f"using pass-1 classifications"
+    )
+    return updated_path
 
 class CommonClassification(object):
     def __init__(self, id=None, order=None, superfamily=None,
@@ -1428,3 +1496,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
