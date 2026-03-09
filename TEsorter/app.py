@@ -3,6 +3,28 @@
 
 '''
 Author: Zhang, Ren-Gang and Wang, Zhao-Xuan, Jacques Dainat
+
+Note mmseq2 ties are settled arbitraily. it just picks the first. EG:
+cat TEsorter_test_r1.work/tmp-6f63399e-1c00-11f1-8800-a8a159c259f8/pass2.m8 | grep 'Col0_chr1:17001174-17006304' | sort -k7 -nr | head -2
+Col0_chr1:17001174-17006304	Col0_chr1:17001165-17016598	1.000	5131	5131	1.000	9194
+Col0_chr1:17001174-17006304	Col0_chr1:16990768-17006321	1.000	5131	5131	1.000	9194
+
+Here, theyre tied at 9194.
+
+'Col0_chr1:17001165-17016598' is identified as having a TSD:
+grep 'Col0_chr1:17001165-17016598' TEsorter_test_r1.work/tmp-6f63399e-1c00-11f1-8800-a8a159c259f8/pass2_classified_updated.fa | grep 'Col0_chr1:17001165-17016598'
+>Col0_chr1:17001165-17016598#LTR/unknown/unknown
+We'd tentitvely labeled it LTR.
+
+'Col0_chr1:16990768-17006321' was identifed as having TIR repeat. 
+cat TEsorter_test_r1.work/TEsorter_test_r1.ltrtools.intact_for_tesorter.fa.rexdb-plant.cls.tsv | grep 'Col0_chr1:16990768-17006321'
+Col0_chr1:16990768-17006321	TIR	EnSpm_CACTA	unknown	unknown	+	TPase|EnSpm_CACTA
+
+Because mmseq2 caught both with equal bitscore, it just picked the first, which was the LTR. 
+
+This causes 2-pass to give the LTR label:
+cat TEsorter_test_r1.work/TEsorter_test_r1.ltrharvest.full_length.fa.rexdb-plant.cls.lib.fa | grep 'Col0_chr1:17001174-17006304'
+>Col0_chr1:17001174-17006304#LTR/unknown/unknown
 '''
 import sys
 import os
