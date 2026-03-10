@@ -11,10 +11,10 @@ Col0_chr1:17001174-17006304	Col0_chr1:16990768-17006321	1.000	5131	5131	1.000	91
 
 Here, theyre tied at 9194.
 
-'Col0_chr1:17001165-17016598' is identified as having a TSD:
+'Col0_chr1:17001165-17016598' was provided using "--pass2-classified-fasta" and was identified as having a TSD:
 grep 'Col0_chr1:17001165-17016598' TEsorter_test_r1.work/tmp-6f63399e-1c00-11f1-8800-a8a159c259f8/pass2_classified_updated.fa | grep 'Col0_chr1:17001165-17016598'
 >Col0_chr1:17001165-17016598#LTR/unknown/unknown
-We'd tentitvely labeled it LTR.
+Due to having TSD, we had tentitvely labeled it LTR/unknown/unknown.
 
 'Col0_chr1:16990768-17006321' was identifed as having TIR repeat. 
 cat TEsorter_test_r1.work/TEsorter_test_r1.ltrtools.intact_for_tesorter.fa.rexdb-plant.cls.tsv | grep 'Col0_chr1:16990768-17006321'
@@ -23,8 +23,13 @@ Col0_chr1:16990768-17006321	TIR	EnSpm_CACTA	unknown	unknown	+	TPase|EnSpm_CACTA
 Because mmseq2 caught both with equal bitscore, it just picked the first, which was the LTR. 
 
 This causes 2-pass to give the LTR label:
-cat TEsorter_test_r1.work/TEsorter_test_r1.ltrharvest.full_length.fa.rexdb-plant.cls.lib.fa | grep 'Col0_chr1:17001174-17006304'
+cat TEsorter_test_r1.work/TEsorter_test_r1.ltrharvest.full_length.fa.rexdb-plant.cls.lib | grep 'Col0_chr1:17001174-17006304'
 >Col0_chr1:17001174-17006304#LTR/unknown/unknown
+
+It's not entirely clear though. 
+If I add 'tstart,tend' to mmseqs --format-output, I can the structure of the alignment:
+|<——————— [TARGET] that looks like LTR-RT (contains TSD) ————————|——[QUERY]——|                          
+                                                                 |<————————————— [TARGET] that looks like TIR (contains TPase) ——————————————>|
 '''
 import sys
 import os
