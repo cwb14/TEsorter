@@ -675,7 +675,7 @@ def classify_by_mmseqs(db_seq, qry_seq, m8_out=None, seqtype="nucl", ncpu=4,
         ncpu=ncpu,
         min_seq_id=min_seq_id,
         min_cov=min_cov,
-        cov_mode=2,
+        cov_mode=0, # was using 2 at first, but 0 outperforms.
         min_aln_len=int(min_length),
         sensitivity=sensitivity,
     )
